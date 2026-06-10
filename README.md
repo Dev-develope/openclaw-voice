@@ -231,3 +231,63 @@ MIT License — see [LICENSE](LICENSE).
 ---
 
 **Made with 🦞 by [Purple Horizons](https://purplehorizons.io)**
+
+---
+
+## 60db Provider (alongside ElevenLabs)
+
+This fork adds **60db** as an additional cloud provider for TTS, STT, and (via config only) LLM. The existing fallback chains stay intact — 60db slots in as the second cloud option, used only when ElevenLabs (TTS) or Whisper (STT) aren't available.
+
+Reference: [docs.60db.ai](https://docs.60db.ai)
+
+### Fallback chains
+
+| Concern | New order |
+|---|---|
+| **TTS** | ElevenLabs → **60db** → Chatterbox → XTTS → mock |
+| **STT** | faster-whisper → openai-whisper → **60db** → mock |
+| **LLM** | Whatever `OPENCLAW_BACKEND_URL` points at (no separate switch) |
+
+### Surfaces wired
+
+`src/server/sixtydb.py` is a single module exposing every 60db API surface — the fallback chains pick the right one per role, but all are callable directly:
+
+| Function | 60db endpoint | Used by |
+|---|---|---|
+| `synthesize_ws_stream()` | `wss://api.60db.ai/ws/tts` (LINEAR16 @ 24000) | TTS streaming (default) |
+| `synthesize_rest_sync()` | `POST /tts-synthesize` | TTS sync fallback |
+| `synthesize_ndjson_stream()` | `POST /tts-stream` (NDJSON) | exposed; not on the hot path |
+| `transcribe_rest()` | `POST /stt` (multipart) | STT default |
+| `transcribe_ws_stream()` | `wss://api.60db.ai/ws/stt` | exposed for future continuous mode |
+
+### Env vars
+
+```env
+SIXTYDB_API_KEY=sk_live_...                       # required to enable
+SIXTYDB_API_BASE=https://api.60db.ai              # optional override
+SIXTYDB_TTS_VOICE_ID=fbb75ed2-975a-40c7-9e06-38e30524a9a1
+SIXTYDB_STT_LANGUAGE=auto                          # or any ISO 639-1
+```
+
+### Route the LLM through 60db too
+
+No code change needed — the existing `AIBackend` accepts any OpenAI-compatible base URL:
+
+```env
+OPENCLAW_BACKEND_URL=https://api.60db.ai
+OPENCLAW_BACKEND_MODEL=60db-tiny
+OPENAI_API_KEY=<your-sixtydb-key>     # forwarded as the bearer
+```
+
+### How the TTS pipeline stays consistent
+
+The browser's Web Audio playback assumes **PCM @ 24 kHz** (see `pcm_24000` in the ElevenLabs path). 60db's WebSocket TTS supports `LINEAR16 @ 24000` — so the chunks the server forwards over the WebSocket are byte-for-byte the same shape as ElevenLabs', and `src/client/index.html` plays them with zero change.
+
+### Audio formats summary
+
+| Path | Provider | Format | Why |
+|---|---|---|---|
+| ElevenLabs streaming | cloud | `pcm_24000` | matches Web Audio expectation |
+| 60db streaming (WS) | cloud | `LINEAR16` @ 24000 | identical wire shape to ElevenLabs |
+| 60db sync REST | cloud | mp3 → decoded to float32 | matches Chatterbox/XTTS return type |
+| Chatterbox / XTTS | local | float32 numpy | model-native |

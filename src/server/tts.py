@@ -54,6 +54,22 @@ class ChatterboxTTS:
             except Exception as e:
                 logger.warning(f"ElevenLabs failed: {e}")
         
+        # Try 60db cloud TTS (positioned after ElevenLabs per design — only
+        # used when ELEVENLABS_API_KEY is absent but SIXTYDB_API_KEY is set).
+        # Streams LINEAR16 @ 24000 over WebSocket so the existing pcm_24000
+        # browser pipeline stays identical.
+        sixtydb_key = os.environ.get("SIXTYDB_API_KEY")
+        if sixtydb_key:
+            try:
+                from . import sixtydb as sixtydb_client  # noqa: F401
+                self._backend = "60db"
+                logger.info("✅ 60db TTS ready")
+                return
+            except ImportError as e:
+                logger.warning(f"60db client unavailable: {e}")
+            except Exception as e:
+                logger.warning(f"60db init failed: {e}")
+
         # Try Chatterbox (self-hosted)
         try:
             from chatterbox.tts import ChatterboxTTS as CBModel
@@ -122,6 +138,18 @@ class ChatterboxTTS:
                     yield chunk
             except Exception as e:
                 logger.error(f"ElevenLabs streaming error: {e}")
+        elif self._backend == "60db":
+            # 60db TTS WebSocket — LINEAR16 PCM @ 24000 Hz matches the
+            # same pcm_24000 contract ElevenLabs uses, so the browser
+            # playback path doesn't care which engine produced the bytes.
+            try:
+                from . import sixtydb as sixtydb_client
+                async for chunk in sixtydb_client.synthesize_ws_stream(
+                    text=text, voice_id=self.voice_id, sample_rate=24000,
+                ):
+                    yield chunk
+            except Exception as e:
+                logger.error(f"60db streaming error: {e}")
         else:
             # Non-streaming fallback
             audio = await self.synthesize(text)
@@ -148,6 +176,30 @@ class ChatterboxTTS:
                 logger.error(f"ElevenLabs TTS error: {e}")
                 return np.zeros(16000, dtype=np.float32)  # 1 sec silence on error
         
+        elif self._backend == "60db":
+            # Sync path uses /tts-synthesize (one-shot mp3). We return
+            # float32 in [-1, 1] like the other backends — main.py /
+            # streaming.py concatenates these arrays directly.
+            try:
+                from . import sixtydb as sixtydb_client
+                # Async function but this is the sync wrapper; bridge via
+                # asyncio.run on a temporary loop (we're already inside an
+                # executor when called from synthesize()).
+                audio_bytes = asyncio.run(
+                    sixtydb_client.synthesize_rest_sync(text, voice_id=self.voice_id)
+                )
+                # Decode mp3 to float32 via soundfile. The result is
+                # whatever sample rate 60db chose (typically 24000).
+                import io
+                import soundfile as sf
+                data, _sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+                if data.ndim > 1:
+                    data = data.mean(axis=1)  # mono
+                return data
+            except Exception as e:
+                logger.error(f"60db TTS error: {e}")
+                return np.zeros(16000, dtype=np.float32)
+
         elif self._backend == "chatterbox":
             if self.voice_sample:
                 audio = self.model.generate(text, audio_prompt=self.voice_sample)

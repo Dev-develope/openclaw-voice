@@ -3,6 +3,7 @@ Speech-to-Text module using Whisper.
 """
 
 import asyncio
+import os
 from typing import Optional
 
 import numpy as np
@@ -79,6 +80,19 @@ class WhisperSTT:
         except Exception as e:
             logger.warning(f"openai-whisper failed: {e}")
         
+        # Try 60db cloud STT (third in the chain — only kicks in if both
+        # Whisper variants are missing AND the user explicitly set up 60db).
+        if os.environ.get("SIXTYDB_API_KEY"):
+            try:
+                from . import sixtydb as sixtydb_client  # noqa: F401
+                self._backend = "60db"
+                logger.info("✅ 60db STT ready (cloud)")
+                return
+            except ImportError as e:
+                logger.warning(f"60db client unavailable: {e}")
+            except Exception as e:
+                logger.warning(f"60db STT init failed: {e}")
+
         # Mock mode for testing
         logger.warning("⚠️ No STT backend - using mock mode")
         self._backend = "mock"
@@ -102,7 +116,24 @@ class WhisperSTT:
         elif self._backend == "openai-whisper":
             result = self.model.transcribe(audio, language=self.language)
             return result["text"].strip()
-        
+
+        elif self._backend == "60db":
+            # 60db /stt is async — we're inside an executor so spinning up
+            # a one-shot loop is the simplest bridge that doesn't change
+            # the existing sync `_transcribe_sync` contract.
+            try:
+                from . import sixtydb as sixtydb_client
+                return asyncio.run(
+                    sixtydb_client.transcribe_rest(
+                        audio,
+                        sample_rate=16000,
+                        language=None if self.language == "auto" else self.language,
+                    )
+                )
+            except Exception as e:
+                logger.error(f"60db STT error: {e}")
+                return ""
+
         else:
             # Mock mode - return placeholder
             logger.debug(f"Mock STT: received {len(audio)} samples")
